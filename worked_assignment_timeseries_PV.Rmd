@@ -1,0 +1,314 @@
+---
+title: "Final assignment predictive modelling (timeseries)"
+author: "Pieter Vreeburg"
+date: "January 18, 2018"
+output: word_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libs_settings, include = FALSE}
+library(readr) # for reading csv data
+library(ggplot2) # for plotting
+library(tseries) # for adf.test
+library(forecast) # for forecasting and ggAcf() / ggPacf()
+library(gridExtra) # for arranging plots
+library(lmtest) # for coeftest
+library(tidyr)
+# read series
+asylum <- read_csv2('timeseries_asielverzoeken.csv')
+```
+
+## Introduction
+
+This assignment uses the 'asylum requests in the Netherlands, 1975 - 2016' data set (available [here](http://statline.cbs.nl/Statweb/publication/?VW=T&DM=SLNL&PA=80059NED&D1=0&D2=0&D3=a&HD=171227-2026&HDR=T&STB=G1,G2&CHARTTYPE=3)) from Statistics Netherlands (Centraal Bureau voor de Statistiek). This set contains the total number of asylum requests (first requests, subsequent requests and follow-up requests for family members of the primary asylum-seeker) submitted to the Dutch Immigration and Naturalization Service per year.
+
+The data points for 2012 and 2016 are provisional and will probably change before finalizing. From 2016 onwards 'relocated' refugees (refugees who are first admitted to Greece or Italy and are redistributed from there to other EU countries) are included in the counts.
+
+Figure 1 below shows the total number of asylum request in the Netherlands per year. The series displays steep spikes in the periods 1993 - 1994, 1998 - 2000 and 2014 - 2015. These spikes are followed by sharp drops which return the series back to, or below, the level before the spike. The first and second spikes are caused by refugees fleeing the conflicts in former Yugoslavia (mixed with Somali refugees for the first spike and Afghan refugees for second spike). The third spike in 2014 - 2015 mostly results from the refugee streams brought on by the conflicts in the middle-east following the 'Arab spring' (mainly the civil war in Syria).
+
+```{r plot_series, echo = FALSE}
+ggplot(data = asylum, aes(x = year, y = cnt)) + geom_line(size = 1) + theme_bw() +
+  labs(y = 'Number of asylum requests', 
+       title = 'Figure 1: number of asylum requests (NL p/y)', 
+       subtitle = 'Source: CBS')
+```
+
+Based on figure 1 the series displays no apparent seasonality (cross checked by - unsuccessfully - trying to extract the seasonality component from the series). This is interesting as both the conflicts being fought in the countries of origin and the travel pattern of refugees across the globe have seasonal characteristics (see the 2015 documentary 'Tell spring not to come this year' for an example of the seasonal characteristics of warfare in Afghanistan). This lack of seasonality in the series is probably caused by the data being aggregated on a yearly level while the seasonal components mentioned above should be visible on a monthly or quarterly level. 
+
+## Stationarity
+The series looks non-stationary with rather big differences in variance over time which could be a problem when trying to fit an Arima model. This is confirmed by both an ACF plot and an 'Augmented Dickey-Fuller' (ADF) test (H~0: series is not stationary, H~a: series is stationary (instead of explosive which seems not likely for this series), p-value > 0.05, therefore H~0 cannot be rejected).
+
+```{r adf_1, echo = FALSE}
+# test non-stationarity with ADF-test
+ts_asylum <- ts(asylum$cnt, start = 1975)
+ggAcf(ts_asylum, lag.max = 40) + theme_bw() + 
+  labs(title = 'Figure 2: ACF plot of the number of asylum requests')
+adf.test(ts_asylum, alternative = "s")
+
+```
+
+Taking first differences could be enough to get a stationary series, this series of first differences is plotted in figure 3 below. 
+
+```{r plot_once_dif, echo = FALSE}
+# plot once-differenced series
+asylum_diff <- data.frame(asylum$year[-1], diff(asylum$cnt, differences = 1))
+colnames(asylum_diff) <- c('year', 'change_1y')
+ggplot(data = asylum_diff, aes(x = year, y = change_1y)) + geom_line(size = 1) + theme_bw() +
+  labs(y = 'Change in asylum requests', 
+       title = 'Figure 3: Asylum requests first differences')
+``` 
+
+An ACF-plot of the first differences displays non-significant auto-correlations (with one exception at lag 21) indicating the series needs no further differencing in order to fit an Arima model. A follow-up ADF-test however indicates non-stationary characteristics (H~0 and H~a as before, p-value > 0.05, therefore H~0 cannot be rejected). After some experimenting I settled for taking first-differences and ignoring the results of the ADF-test because:
+
+* Differencing twice seems to introduce over-differencing. Every model I tried to fit came up with non-significant coefficients and / or the residuals violated the white noise criteria.
+* Differencing twice seemed to make interpretation more difficult (predictions of 'change-of-the-change'?)
+
+```{r adf_2, echo = FALSE}
+# test non-stationarity with ADF-test
+ggAcf(asylum_diff[ , 2], lag.max = 40) + theme_bw() + 
+  labs(title = 'Figure 4: ACF plot asylum requests first differences')
+adf.test(asylum_diff[, 2], alternative = "s")
+```
+
+## Estimation and hold-out sample
+The data set is split into an estimation sample and a hold-out sample. Both samples are plotted in figure 4 below. While any model will have a hard time predicting the large swings at the tail end of the hold-out sample (from 29.890 in 2014 to 58.880 in 2015 and back to 32.840 in 2016), it will be interesting to see how well the model will predict the more moderate changes in the remainder of the hold-out sample.
+
+```{r plot_samples, echo = FALSE}
+# plot samples
+ggplot(data = asylum_diff, aes(x = year, y = change_1y, colour = (year > 2002), group = 1)) + geom_line(size = 1) + theme_bw() +
+  scale_color_manual(labels = c('Estimation', 'Hold-out'), values = c('red', 'blue')) +
+  labs(y = 'Change in asylum requests', 
+       title = 'Figure 5: estimation and hold-out samples',
+       col = 'Sample')
+  
+```
+
+```{r est_hold, echo = FALSE}
+# get estimation sample from the differenced time-series for ACP & PACF plots
+ts_asylum_diff <- ts(asylum_diff$change_1y, start = 1976)
+est_ts_asylum_diff <- window(ts_asylum_diff, 1976, 2002)
+```
+
+## Model selection
+The ACF and PACF plots for the estimation sample both display significant auto-correlation at the second lag, which suggests a (2,1,2) model could fit the data. The evidence for such a model is not very convincing however, therefore variations of a (1,1,1) model will also be included in the model selection. Models which report significant coefficients will be kept for further analysis.
+
+```{r ACF_PACF_est, echo = FALSE}
+# ACF and PACF plots of estimation sample
+est_acf <- ggAcf(est_ts_asylum_diff, lag.max = 25) + theme_bw() + 
+  labs(title = 'Figure 6: ACF plot estimation sample')
+est_pacf <- ggPacf(est_ts_asylum_diff, lag.max = 25) + theme_bw() + 
+  labs(title = 'Figure 7: PACF plot estimation sample')
+grid.arrange(est_acf, est_pacf)
+```
+
+All candidate models (2,1,2 / 1,1,1 / 1,1,0 / 0,1,1) are fitted to the estimation sample with the following results:
+
+```{r estim_sample_org, echo = FALSE}
+# get estimation sample from regular timeseries, differencing is done within the Arima() function
+est_ts_asylum <- window(ts_asylum, 1975, 2002)
+```
+
+*Candidate model 1*
+```{r fit, echo = FALSE}
+
+# fit candidate model 1
+fit <- Arima(est_ts_asylum, order = c(2, 1, 2))
+fit
+coeftest(fit)
+```
+
+*Candidate model 2*
+```{r fit2, echo = FALSE}
+# fit candidate model 2
+fit2 <- Arima(est_ts_asylum, order = c(1, 1, 1))
+fit2
+coeftest(fit2)
+```
+
+*Candidate model 3*
+```{r fit3, echo = FALSE}
+# fit candidate model 3
+fit3 <- Arima(est_ts_asylum, order = c(0, 1, 1))
+fit3
+coeftest(fit3)
+```
+
+*Candidate model 4*
+```{r fit4, echo = FALSE}
+# fit candidate model 4
+fit4 <- Arima(est_ts_asylum, order = c(1, 1, 0))
+fit4
+coeftest(fit4)
+```
+
+The (2,1,2) (AICc: `r round(fit$aicc, 2)`) and (1,1,1) (AICc: `r round(fit3$aicc, 2)`) models report significant coefficients and will be kept for further analysis. With the principle of Occam's razor in mind and the minute difference in AICc values the simpler (1,1,1) model is selected as the preferred model for the estimation sample. The (2,1,2) model is retained as a possible alternative.
+
+## Model evaluation
+
+### Preferred model (1,1,1) ###
+The selected model's performance is measured by evaluating the white noise properties of the residuals (no residual auto-correlation, residuals are normally distributed). An ACF plot of the residuals shows no significant auto-correlation, indicating that no relevant information about the series is missed by this model.
+
+```{r model_eval1, echo = FALSE}
+# test white noise properties of initial model's residuals
+residuals_pref <- as.double(fit2$residuals)
+# autocorrelation: ACF plot of residuals
+ggAcf(residuals_pref, lag.max = 25) + theme_bw() + 
+  labs(title = 'Figure 8: ACF plot residuals, Arima(1,1,1) model')
+```
+
+A follow-up Ljung-Box test reports no auto-correlation at lags 1-25 (H~0: no significant auto-correlation, H~a: significant auto-correlation, p-value > 0.05, therefore H~0 cannot not be rejected).
+
+```{r model_eval2, echo = FALSE}
+Box.test(residuals_pref, lag = 25, type = 'Ljung-Box')
+```
+
+The residuals are normally distributed as evidenced by the results of a Shapiro-Wilk test for normality (H~0: residuals are normally distributed, H~a: residuals are not normally distributed, p-value > 0.05, therefore H~0 cannot be rejected).
+
+```{r model_eval3, echo = FALSE}
+# normality: shapiro-wilk test & histogram
+shapiro.test(residuals_pref)
+plot_data <- data.frame(residuals_pref)
+ggplot(data = plot_data, aes(x = residuals_pref)) + geom_histogram(bins = 9) + theme_bw() +
+  labs(title = 'Figure 9: histogram residuals, Arima(1,1,1) model')
+```
+
+### Alternative model (2,1,2) ###
+The alternative model's performance is also measured by evaluating the white noise properties of the residuals. An ACF plot of the residuals shows no significant auto-correlation, indicating that no relevant information about the series is missed by this model.
+
+```{r alt_model_eval1, echo = FALSE}
+# test white noise properties of alternative model's residuals
+residuals_alt <- as.double(fit$residuals)
+# autocorrelation: ACF plot of residuals
+ggAcf(residuals_alt, lag.max = 25) + theme_bw() + 
+  labs(title = 'Figure 10: ACF plot residuals, Arima(2,1,2) model')
+```
+
+This is corroborated by the results of a Ljung-Box test which reports no evidence of any auto-correlation at lags 1-25 (H~0: no significant auto-correlation, H~a: significant auto-correlation, p-value > 0.05, therefore H~0 will not be rejected).
+
+```{r alt_model_eval2, echo = FALSE}
+Box.test(residuals_alt, lag = 25, type = 'Ljung-Box')
+```
+
+The residuals are not normally distributed as evidenced by the results of a Shapiro-Wilk test for normality (H~0: residuals are normally distributed, H~a: residuals are not normally distributed, p-value < 0.05, therefore H~0 will be rejected and H~a will be accepted).
+
+```{r alt_model_eval3, echo = FALSE}
+# normality: jarque-bera test & histogram
+shapiro.test(residuals_alt)
+plot_data <- data.frame(residuals_alt)
+ggplot(data = plot_data, aes(x = residuals_alt)) + geom_histogram(bins = 9) + theme_bw() +
+  labs(title = 'Figure 11: histogram residuals, Arima(2,1,2) model')
+```
+
+The preferred model's residuals display the desired white noise properties, whereas the alternative model's residuals do not seem to come from a normal distribution. The alternative model is now 2 points behind the preferred model (less parsimonious than the preferred model & residuals are not normally distributed).
+
+The actual observations versus the fitted values of both the preferred model and the alternative model in the estimation sample are plotted in figure 12 and 13 below. 
+
+```{r plot_org_fitted_pref, echo = FALSE}
+# plot original and fitted values for estimation sample with preferred model
+start_end <- attributes(fit2$fitted)$tsp
+years <- seq(start_end[1], start_end[2])
+plot_data <- data.frame(years, as.double(fit2$x), as.double(fit2$fitted))
+colnames(plot_data) <- c('year', 'org', 'fitted')
+plot_data <- gather(plot_data, type, values, -year)
+
+ggplot(data = plot_data, aes(x = year, y = values, color = type)) + 
+  geom_line(size = 1) + theme_bw() +
+  scale_color_manual(labels = c('Fitted', 'Original'), values = c('red', 'blue')) +
+  labs(y = 'Asylum requests', 
+      title = 'Figure 12: fitted values, Arima(1,1,1) model',
+      col = 'Series')
+```
+
+```{r plot_org_fitted_alt, echo = FALSE}
+# plot original and fitted values for estimation sample with alternative model
+start_end <- attributes(fit$fitted)$tsp
+years <- seq(start_end[1], start_end[2])
+plot_data <- data.frame(years, as.double(fit$x), as.double(fit$fitted))
+colnames(plot_data) <- c('year', 'org', 'fitted')
+plot_data <- gather(plot_data, type, values, -year)
+
+ggplot(data = plot_data, aes(x = year, y = values, color = type)) + 
+  geom_line(size = 1) + theme_bw() +
+  scale_color_manual(labels = c('Fitted', 'Original'), values = c('red', 'blue')) +
+  labs(y = 'Asylum requests', 
+      title = 'Figure 13: fitted values, Arima(2,1,2) model',
+      col = 'Series')
+```
+
+## Testing the preferred and alternative models in the hold-out sample
+
+Both the preferred and the alternative models are fitted to the data in the hold-out sample. AICc and root MSE will be used as arbiters to select the model which will be used to create the forecast. In order to fairly judge the predictive power of both models I have removed the last two observations (2015 - 2016). These observations deviate strongly from the norm and will probably have a disproportional influence on any measures of model fit making comparisons between both models difficult.
+
+(R also won't fit the models to the sample without removing these observations)
+
+*Preferred model*
+```{r fit_hold_pref, echo = FALSE}
+# hold-out sample
+hold_ts_asylum <- window(ts_asylum, 2003, 2014)
+
+# fit preferred model to hold-out sample
+fit_hold_pref <- Arima(hold_ts_asylum, order = c(1, 1, 1))
+fit_hold_pref
+```
+
+*Alternative model*
+```{r fit_hold_alt, echo = FALSE}
+# fit alternative model to hold-out sample
+fit_hold_alt <- Arima(hold_ts_asylum, order = c(2, 1, 2))
+fit_hold_alt
+```
+
+The preferred model reports a lower AICc value than the alternative model (preferred: `r round(fit_hold_pref$aicc, 2)` versus alternative: `r round(fit_hold_alt$aicc, 2)`). It's residuals also satisfy both white noise criteria and is preferred for being the most parsimonious of the two models. The alternative model scores worse in the aspects mentioned above, but reports a much lower root MSE than the preferred model (alternative: `r round(sqrt(mean(fit_hold_alt$residuals ^ 2)), 2)` versus preferred: `r round(sqrt(mean(fit_hold_pref$residuals ^ 2)), 2)`).
+
+Despite the lower root MSE value of the alternative model the preferred model is picked to create the forecast as, all factors considered, the preferred model seems a more robust and balanced model to fit to this specific time-series.
+
+## Re-estimation and forecast
+
+The preferred model is re-estimated for the entire time-series. The actual observations versus the fitted values of the re-estimated model are plotted in figure 14 below. 
+
+```{r re_estim_plot, echo = FALSE}
+# re-estimate and plot
+fit_final <- Arima(ts_asylum, order = c(1, 1, 1))
+fit_final
+coeftest(fit_final)
+start_end <- attributes(fit_final$fitted)$tsp
+years <- seq(start_end[1], start_end[2])
+plot_data <- data.frame(years, as.double(fit_final$x), as.double(fit_final$fitted))
+colnames(plot_data) <- c('year', 'org', 'fitted')
+plot_data <- gather(plot_data, type, values, -year)
+
+ggplot(data = plot_data, aes(x = year, y = values, color = type)) + 
+  geom_line(size = 1) +
+  scale_color_manual(labels = c('Fitted', 'Original'), values = c('red', 'blue')) +
+  theme_bw() +
+  labs(y = 'Asylum requests', 
+    title = 'Figure 14: fitted values, Arima(1,1,1) model',
+    col = 'Series')
+```
+
+The re-estimated model is subsequently used to create a 5-year ahead forecast. The forecast results are displayed in figure 15 below.
+
+```{r forecast, echo = FALSE}
+# forecast
+fc_10 <- forecast(fit_final, h = 5)
+autoplot(fc_10, size = 2) + # for some reason the size (and other) settings in autoplot do not work as documented, I am probably doing something wrong, but have not been able to find a solution online (within a reasonable timeframe)
+  theme_bw() +
+  labs(y = 'Number of asylum requests)',
+       x = 'Year', 
+      title = 'Figure 15: 5-year ahead forecast, Arima(1,1,1) model')
+```
+
+## Interpretation
+
+The final (1,1,1) model I arrived at forecasts a slowly downward sloping trend, which seems to fit with the most recent (16-1-2018) figures for 2017 ([here](https://ind.nl/nieuws/paginas/asielinstroom-in-2017-gelijk-aan-2016.aspx)). Due to the wide margins of error however any specific prediction will be most likely off and could potentially be anywhere in the range seen between 1975 and 2016. 
+
+The difficulty of creating a specific forecast (supported by the reported coefficients of the re-estimated model) seems to reflect a complex process where the number of asylum requests is driven forcefully up or down by the geo-political shocks (conflicts, changes in policy, etc.) occurring in the system. Next to this random up-and-down pattern is a more systematic pattern where (probably) follow-up migration (in Dutch 'gezinshereniging') influences the number of asylum request in every following year.
+
+## Reflection
+
+I learned a lot from this assignment, especially how decisions which were made rather quick at the start of the analysis (pick the order of differencing) have a big influence on every following step of the analysis. I struggled with picking a fitting model for the series and telling a convincing story with it until I took another critical look at the early steps in my analysis. After I picked the (hopefully) correct order of differencing everything started to come together.
+
+Another thing I learned from this assignment is the importance of a smooth workflow for experimenting. While I was working on the analysis I simultaneously tried to create the text to go with it. When I changed some fundamental aspects of my analysis I had to rewrite all my earlier text. Next time I keep working on my analysis until I can visualize the *complete* story I want to tell, before I start to write any accompanying text.
